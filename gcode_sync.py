@@ -124,9 +124,12 @@ class GCodeKinematicsEngine:
         return tuple(last_move['end'])
 
 def position_tracker_thread():
-    """Outputs current and +5 sec positions every 0.5s once sequence sync begins."""
     engine = GCodeKinematicsEngine()
     engine.parse_gcode_file("print_job.gcode")
+
+    last_seq = None
+    last_real_time = None
+    time_multiplier = 1.0  # 1.0 means perfect sync, < 1.0 means printer is slower than math
 
     while True:
         time.sleep(0.5)
@@ -136,23 +139,37 @@ def position_tracker_thread():
             t_recv = seq_timestamp
             
         if seq is None or t_recv is None:
-            continue  # Wait for the first M118 message
+            continue
             
-        # Get the global job time offset associated with this sequence number
-        # Default to 0.0 if the seq isn't found in the G-code, though it ideally should be
+        # If we hit a new sequence number, calculate how fast the printer actually moved
+        # compared to our G-code math, and update the multiplier.
+        if seq != last_seq and last_seq is not None:
+            real_delta = t_recv - last_real_time
+            gcode_delta = engine.seq_times.get(seq, 0.0) - engine.seq_times.get(last_seq, 0.0)
+            
+            if real_delta > 0 and gcode_delta > 0:
+                # e.g., Math said 10s, reality took 12s -> multiplier = 0.83
+                # We blend it with the previous multiplier (0.5 weight) to prevent wild swings
+                new_multiplier = gcode_delta / real_delta
+                time_multiplier = (time_multiplier * 0.5) + (new_multiplier * 0.5)
+
+        last_seq = seq
+        last_real_time = t_recv
+
         base_job_time = engine.seq_times.get(seq, 0.0)
-        
-        # Calculate true elapsed time into the entire print job
         elapsed_since_m118 = time.time() - t_recv
-        total_job_time = base_job_time + elapsed_since_m118
         
-        # Calculate coordinates using time projection
+        # Apply the dynamic multiplier to the time elapsed since the last sync
+        adjusted_elapsed = elapsed_since_m118 * time_multiplier
+        total_job_time = base_job_time + adjusted_elapsed
+        
         curr_pos = engine.get_position_at_elapsed_time(total_job_time)
-        future_pos = engine.get_position_at_elapsed_time(total_job_time + 5.0)
+        # Apply the multiplier to the 5-second lookahead as well
+        future_pos = engine.get_position_at_elapsed_time(total_job_time + (5.0 * time_multiplier))
         
-        print(f"[Seq #{seq}] T+{total_job_time:.2f}s | "
-              f"Current Position: X={curr_pos[0]:.2f}, Y={curr_pos[1]:.2f}, Z={curr_pos[2]:.2f} | "
-              f"Future (+5s): X={future_pos[0]:.2f}, Y={future_pos[1]:.2f}, Z={future_pos[2]:.2f}")
+        print(f"[Seq #{seq} | Drift: {time_multiplier:.2f}x] T+{total_job_time:.2f}s | "
+              f"Current: X={curr_pos[0]:.1f}, Y={curr_pos[1]:.1f}, Z={curr_pos[2]:.1f} | "
+              f"Future (+5s): X={future_pos[0]:.1f}, Y={future_pos[1]:.1f}, Z={future_pos[2]:.1f}")
 
 def send_pump_command(ser, channel, pressure):
     if pressure > 2068:

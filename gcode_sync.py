@@ -34,18 +34,21 @@ seq_timestamp = None
 
 class GCodeKinematicsEngine:
     def __init__(self):
-        self.moves = [] # List of tuples: (start_pos, end_pos, speed_mm_s, total_dist, move_duration)
+        self.moves = [] 
+        self.seq_times = {}  # Maps M118 sequence numbers to their timestamp in the G-code
         self.current_pos = [0.0, 0.0, 0.0]
-        self.current_feedrate = 1000.0 / 60.0 # Default feedrate in mm/s
+        self.current_feedrate = 1000.0 / 60.0  # Default feedrate in mm/s
 
     def parse_gcode_file(self, filepath):
-        """Parses a pre-sliced G-code file to extract line segments and execution timing."""
-        gcode_re = re.compile(r'([X-ZX-ZFE])(-?\d+\.?\d*)')
+        """Parses a pre-sliced G-code file to extract line segments, execution timing, and sync markers."""
+        # Cleaned up regex to accurately capture X, Y, Z, F, and E
+        gcode_re = re.compile(r'([XYZFE])(-?\d+\.?\d*)')
         current_pos = [0.0, 0.0, 0.0]
+        accumulated_time = 0.0
         
         with open(filepath, 'r') as f:
             for line in f:
-                line = line.split(';')[0].strip() # Strip comments
+                line = line.split(';')[0].strip()  # Strip comments
                 if not line:
                     continue
                 
@@ -64,7 +67,7 @@ class GCodeKinematicsEngine:
                             if axis == 'X': new_pos[0] = val
                             elif axis == 'Y': new_pos[1] = val
                             elif axis == 'Z': new_pos[2] = val
-                            elif axis == 'F': feedrate = val / 60.0 # convert mm/min to mm/s
+                            elif axis == 'F': feedrate = val / 60.0  # convert mm/min to mm/s
                     
                     # Calculate segment length
                     dx = new_pos[0] - current_pos[0]
@@ -79,39 +82,51 @@ class GCodeKinematicsEngine:
                         'end': list(new_pos),
                         'dist': dist,
                         'feedrate': feedrate,
-                        'duration': duration
+                        'duration': duration,
+                        'start_time': accumulated_time  # Save start time for robust lookups
                     })
                     
+                    accumulated_time += duration
                     current_pos = new_pos
                     self.current_feedrate = feedrate
+                    
+                # Capture M118 markers to map sequence numbers to their time in the print
+                elif cmd == 'M118':
+                    numbers = re.findall(r'\b\d+\b', line)
+                    if numbers:
+                        seq_val = int(numbers[0])
+                        self.seq_times[seq_val] = accumulated_time
 
     def get_position_at_elapsed_time(self, elapsed_seconds):
         """Calculates exact (X, Y, Z) coordinate based on cumulative movement time."""
-        accumulated_time = 0.0
-        
+        if not self.moves:
+            return (0.0, 0.0, 0.0)
+            
+        # Bounds checking to prevent out-of-bounds coordinates
+        if elapsed_seconds <= 0:
+            return tuple(self.moves[0]['start'])
+            
+        last_move = self.moves[-1]
+        if elapsed_seconds >= last_move['start_time'] + last_move['duration']:
+            return tuple(last_move['end'])
+            
+        # Find the correct move segment based on pre-calculated start times
         for move in self.moves:
-            if accumulated_time + move['duration'] >= elapsed_seconds:
-                # Interpolate inside this line segment
-                time_in_move = elapsed_seconds - accumulated_time
+            if move['start_time'] <= elapsed_seconds <= move['start_time'] + move['duration']:
+                time_in_move = elapsed_seconds - move['start_time']
                 fraction = time_in_move / move['duration'] if move['duration'] > 0 else 1.0
                 
                 x = move['start'][0] + fraction * (move['end'][0] - move['start'][0])
                 y = move['start'][1] + fraction * (move['end'][1] - move['start'][1])
                 z = move['start'][2] + fraction * (move['end'][2] - move['start'][2])
                 return (x, y, z)
-            
-            accumulated_time += move['duration']
-        
-        # Return the final destination if elapsed time exceeds the total path duration
-        if self.moves:
-            return tuple(self.moves[-1]['end'])
-        return (0.0, 0.0, 0.0)
+                
+        return tuple(last_move['end'])
 
 def position_tracker_thread():
     """Outputs current and +5 sec positions every 0.5s once sequence sync begins."""
     engine = GCodeKinematicsEngine()
-    # If using a pre-parsed G-code file for trajectory lookup, load it here:
-    # engine.parse_gcode_file("print_job.gcode")
+    engine.parse_gcode_file("print_job.gcode")
 
     while True:
         time.sleep(0.5)
@@ -121,17 +136,21 @@ def position_tracker_thread():
             t_recv = seq_timestamp
             
         if seq is None or t_recv is None:
-            continue # Wait for the first M118 message
+            continue  # Wait for the first M118 message
             
-        # Time elapsed since the last M118 message arrived
+        # Get the global job time offset associated with this sequence number
+        # Default to 0.0 if the seq isn't found in the G-code, though it ideally should be
+        base_job_time = engine.seq_times.get(seq, 0.0)
+        
+        # Calculate true elapsed time into the entire print job
         elapsed_since_m118 = time.time() - t_recv
+        total_job_time = base_job_time + elapsed_since_m118
         
         # Calculate coordinates using time projection
-        # Note: Replace 'elapsed_since_m118' with total estimated job runtime if matching absolute G-code time
-        curr_pos = engine.get_position_at_elapsed_time(elapsed_since_m118)
-        future_pos = engine.get_position_at_elapsed_time(elapsed_since_m118 + 5.0)
+        curr_pos = engine.get_position_at_elapsed_time(total_job_time)
+        future_pos = engine.get_position_at_elapsed_time(total_job_time + 5.0)
         
-        print(f"[Seq #{seq}] T+{elapsed_since_m118:.2f}s | "
+        print(f"[Seq #{seq}] T+{total_job_time:.2f}s | "
               f"Current Position: X={curr_pos[0]:.2f}, Y={curr_pos[1]:.2f}, Z={curr_pos[2]:.2f} | "
               f"Future (+5s): X={future_pos[0]:.2f}, Y={future_pos[1]:.2f}, Z={future_pos[2]:.2f}")
 

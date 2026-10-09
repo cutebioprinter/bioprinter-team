@@ -20,14 +20,14 @@ def make_circuit_solver(R1: float, R2: float, Rn: float):
 
 
 if __name__ == "__main__":
-    R1, R2, Rn = 40.0, 10.0, 10.0
+    R1, R2, Rn = 40.0, 10.0, 10.0 # modify values
     f_voltages, g_currents = make_circuit_solver(R1, R2, Rn)
 
     print(f"Resistance: R1 = {R1:.1f} Ω, R2 = {R2:.1f} Ω, Rn = {Rn:.1f} Ω\n")
 
     # 1. Define target currents
-    target_I1 = 0.05   #  100 mA 
-    target_I2 = 0.05   #  -80 mA
+    target_I1 = 0.05   #  100 mA (modify)
+    target_I2 = 0.05   #  -80 mA (modify)
 
     # 2. Compute required voltages
     v1, v2, vn = f_voltages(target_I1, target_I2)
